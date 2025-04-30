@@ -1,6 +1,7 @@
 #include "def.h"
 
 #include <SDL3/SDL_audio.h>
+#include <SDL3/SDL_events.h>
 #include <SDL3/SDL_gpu.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_hints.h>
@@ -40,6 +41,8 @@ typedef enum {
 	KeyUp,
 	KeyDown,
 	KeyEnter,
+	KeyMouseL,
+	KeyMouseR,
 	KeyCount,
 } KeyId;
 
@@ -50,6 +53,8 @@ typedef struct {
 
 typedef struct {
 	KeyPresses keys[KeyCount];
+	f32 mouse_x;
+	f32 mouse_y;
 } InputState;;
 
 typedef struct {
@@ -128,6 +133,7 @@ typedef struct {
 
 typedef struct {
 	f32 window_height;
+	f32 playlist_height;
 	f32 window_width;
 	Glyph ascii_glyphs[128];
 	f32 font_line_skip;
@@ -141,10 +147,8 @@ typedef struct {
 	SDL_AudioSpec dst_audio_spec;
 	SDL_AudioStream *current_audio_stream;
 
-	ByteRange encoded_data;
-
+	SDL_Mutex *avmutex;
 	AVFormatContext *format_context;
-	AVIOContext *avio_context;
 	AVStream *stream;
 	AVCodecContext *codec_context;
 	AVCodec *codec;
@@ -156,6 +160,7 @@ typedef struct {
 	AVPacket *current_packet;
 	AVFrame *current_frame;
 	i32 current_frame_sample;
+	f32 last_relative_duration;
 } Player;
 
 constexpr u8 font_bytes[] = {
@@ -334,6 +339,16 @@ static void free_player(Player *player){
 	}
 }
 
+static void fill_silence(SDL_AudioStream *stream, int amount){
+	char buf[4*4096];
+	memset(buf, 0, sizeof(buf));
+	while(amount > 0){
+		int now = MIN(amount, (int)sizeof(buf));
+		SDL_PutAudioStreamData(stream, buf, now);
+		amount -= now;
+	}
+}
+
 static void audio_stream_callback(void *userdata, SDL_AudioStream *stream, int additional_amount, int total_amount)
 {
 #if 0
@@ -348,18 +363,15 @@ static void audio_stream_callback(void *userdata, SDL_AudioStream *stream, int a
 	}
 #endif
 
+
 	Player *player = (Player*)userdata;
-	char buf[4*4096];
-	memset(buf, 0, sizeof(buf));
 
 	if(player->paused){
-		while(additional_amount > 0){
-			int now = MIN(additional_amount, (int)sizeof(buf));
-			SDL_PutAudioStreamData(stream, buf, now);
-			additional_amount -= now;
-		}
+		fill_silence(stream, additional_amount);
 		return;
 	}
+
+	SDL_LockMutex(player->avmutex);
 
 	int put_count = 0;
 	while(additional_amount > 0){
@@ -406,12 +418,7 @@ static void audio_stream_callback(void *userdata, SDL_AudioStream *stream, int a
 			}
 		}
 		if(player->eof){
-			memset(buf, 0, sizeof(buf));
-			while(additional_amount > 0){
-				int now = MIN(additional_amount, (int)sizeof(buf));
-				SDL_PutAudioStreamData(stream, buf, additional_amount);
-				additional_amount -= sizeof(buf);
-			}
+			fill_silence(stream, additional_amount);
 			break;
 		}
 		// just for now
@@ -435,6 +442,7 @@ static void audio_stream_callback(void *userdata, SDL_AudioStream *stream, int a
 			assert(player->current_packet == NULL);
 			continue;
 		}
+
 		// just for now
 		i32 channel_count = player->codec_context->ch_layout.nb_channels;
 		assert(channel_count == 2);
@@ -458,62 +466,45 @@ static void audio_stream_callback(void *userdata, SDL_AudioStream *stream, int a
 		// TODO: i think i should use linesize here, because for packed audio i don't count the number of samples in each channel, but for all channels.
 		const i32 frame_sample_count = is_planar ? player->current_frame->nb_samples : channel_count * player->current_frame->nb_samples;
 		assert(channel_count < 8);
-		while(current_sample < frame_sample_count){
-			if(is_planar){
-				int how_many_samples = frame_sample_count - current_sample;
-				int how_many_bytes = how_many_samples * (channel_count * sample_size);
-				if(how_many_bytes > additional_amount){
-					how_many_samples = additional_amount / (channel_count * sample_size);
-				}
-				u8 const *ptrs[8];
-				for(int ch = 0; ch < channel_count; ++ch){
-					ptrs[ch] = player->current_frame->data[ch] + current_sample * sample_size;
-				}
-				SDL_PutAudioStreamPlanarData(stream, (const void * const*)ptrs, channel_count, how_many_samples);
-				additional_amount -= how_many_samples * (channel_count * sample_size);
-				current_sample += how_many_samples;
-			} else {
-				int how_many_samples = frame_sample_count - current_sample;
-				int how_many_bytes = how_many_samples * channel_count;
-				if(how_many_bytes > additional_amount){
-					how_many_bytes = additional_amount;
-					how_many_samples = how_many_bytes / channel_count;
-				}
-				SDL_PutAudioStreamData(stream, player->current_frame->data[0] + current_sample * sample_size, how_many_bytes);
-				additional_amount -= how_many_bytes;
-				current_sample += how_many_samples;
+		if(is_planar){
+			int how_many_samples = frame_sample_count - current_sample;
+			int how_many_bytes = how_many_samples * (channel_count * sample_size);
+			if(how_many_bytes > additional_amount){
+				how_many_samples = additional_amount / (channel_count * sample_size);
 			}
-			if(0 == additional_amount){
-				break;
+			u8 const *ptrs[8];
+			for(int ch = 0; ch < channel_count; ++ch){
+				ptrs[ch] = player->current_frame->data[ch] + current_sample * sample_size;
 			}
+			SDL_PutAudioStreamPlanarData(stream, (const void * const*)ptrs, channel_count, how_many_samples);
+			additional_amount -= how_many_samples * (channel_count * sample_size);
+			current_sample += how_many_samples;
+		} else {
+			int how_many_samples = frame_sample_count - current_sample;
+			int how_many_bytes = how_many_samples * channel_count;
+			if(how_many_bytes > additional_amount){
+				how_many_bytes = additional_amount;
+				how_many_samples = how_many_bytes / channel_count;
+			}
+			SDL_PutAudioStreamData(stream, player->current_frame->data[0] + current_sample * sample_size, how_many_bytes);
+			additional_amount -= how_many_bytes;
+			current_sample += how_many_samples;
 		}
+		// Should have exhausted the current frame or provided enough data to the sdl audio stream (or both).
+		assert(current_sample == frame_sample_count || 0 == additional_amount);
+
+		player->last_relative_duration = (player->current_frame->pts + (player->current_frame_sample / (f32)player->current_frame->nb_samples) * player->current_frame->duration) / player->stream->duration;
+
 		player->current_frame_sample = current_sample;
 		if(player->current_frame_sample == frame_sample_count){
 			av_frame_free(&player->current_frame);
 			player->current_frame = NULL;
 			player->current_frame_sample = 0;
 		}
-	}
-}
 
-static int read_packet_callback(void *opaque, uint8_t *buf, int _buf_size)
-{
-	ByteRange *byte_range = (ByteRange *)opaque;
-	assert(_buf_size >= 0);
-	size_t buf_size = _buf_size;
-	size_t to_copy = buf_size;
-	size_t remaining = byte_range->end - byte_range->cur;
-	if(to_copy > remaining)
-		to_copy = remaining;
-	
-	if(0 == to_copy)
-		return AVERROR_EOF;
-	// printf("cur: %zu, remaining: %zu\n", byte_range->cur - byte_range->base, remaining);
-	
-	memcpy(buf, byte_range->cur, to_copy);
-	byte_range->cur += to_copy;
-	
-	return _buf_size;
+	}
+
+	SDL_UnlockMutex(player->avmutex);
 }
 
 // TODO: iterate utf8 codepoints, draw unicode text. don't care about shaping
@@ -535,7 +526,7 @@ static void draw_text(SDL_Renderer *renderer, Glyph *ascii_glyphs, Slice text, f
 				bool ok = SDL_RenderTexture(renderer, ascii_glyphs[c].texture, NULL, &dstrect);
 				if(!ok){
 					const char *err = SDL_GetError();
-					println("failed to render glyph ", err);
+					eprintln("failed to render glyph ", err);
 				}
 			}
 			x += ascii_glyphs[c].advance;
@@ -586,7 +577,7 @@ static void draw_playlist(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
 	if(player->playlist_selected_idx < player->playlist_top){
 		player->playlist_top = player->playlist_selected_idx;
 	}
-	const int num_visible_entries = (int)(player->window_height / player->font_line_skip);
+	const int num_visible_entries = (int)(player->playlist_height / player->font_line_skip);
 	int bottom = player->playlist_top + num_visible_entries;
 	if(player->playlist_selected_idx >= bottom){
 		player->playlist_top = player->playlist_selected_idx - num_visible_entries + 1;
@@ -603,12 +594,38 @@ static void draw_playlist(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
 			draw_text(renderer, player->ascii_glyphs, name, x, y, player->window_width);
 		}
 		y += player->font_line_skip;
-		if(y >= player->window_height){
+		if(y >= player->playlist_height){
 			break;
 		}
 		i++;
 	}
 }
+
+
+static void draw_progress_bar(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
+	if(player->playlist_playing_idx < 0)
+		return;
+
+	// Technically this is a race condition. last_relative_duration is set by
+	// the audio callback thread, but this function is called from the main
+	// thread.  But I don't mind. Worst that can happen is that we read a stale
+	// value for the progress bar.
+	f32 w = player->last_relative_duration * player->window_width;
+	SDL_SetRenderDrawColor(renderer, 0xff, 0xff, 0xff, 0xff);
+	SDL_FRect rect = {.x=0, .y = y, .w = w, .h = player->font_line_skip, };
+	SDL_RenderFillRect(renderer, &rect);
+}
+
+static void draw_currently_playing(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
+	if(player->playlist_playing_idx < 0)
+		return;
+	Slice name = playlist_entry_name(player, player->playlist_playing_idx);
+	draw_text(renderer, player->ascii_glyphs, name, x, y, player->window_width);
+}
+
+//static void libavcodec_log_callback(void*,int,const char*, va_list){
+//}
+
 
 static Result player_load_audio(Player *player, Slice path)
 {
@@ -618,14 +635,12 @@ static Result player_load_audio(Player *player, Slice path)
 	// crash like that, we're gonna need a mutex.
 	SDL_PauseAudioDevice(player->audio_device_id);
 
+	SDL_LockMutex(player->avmutex);
+
 	// free all existing decoding state.
 	if(player->format_context){
 		avformat_free_context(player->format_context);
 		player->format_context = NULL;
-	}
-	if(player->avio_context){
-		avio_context_free(&player->avio_context);
-		player->avio_context = NULL;
 	}
 	if(player->stream){
 		player->stream = NULL;
@@ -647,37 +662,26 @@ static Result player_load_audio(Player *player, Slice path)
 	if(player->current_frame){
 		av_frame_free(&player->current_frame);
 		player->current_frame = NULL;
+		player->current_frame_sample = 0;
 	}
+	player->last_relative_duration = 0.0f;
 
-	if(player->encoded_data.base){
-		av_file_unmap((u8*)player->encoded_data.base, player->encoded_data.end - player->encoded_data.base);
-		player->encoded_data.base = NULL;
-		player->encoded_data.cur = NULL;
-		player->encoded_data.end = NULL;
-	}
-
-	{
-		size_t encoded_len;
-		int rc = av_file_map(path.str, (u8**)&player->encoded_data.base, &encoded_len, 0, NULL);
-		player->encoded_data.cur = player->encoded_data.base;
-		player->encoded_data.end = player->encoded_data.base + encoded_len;
-		if(rc < 0){
-			return ffmpegerr(rc);
-		}
-	}
+	SDL_UnlockMutex(player->avmutex);
 
 	AVFormatContext *format_ctx = avformat_alloc_context();
 	if(format_ctx == NULL){
 		return R(ErrAllocFailed);
 	}
-	constexpr size_t avio_ctx_buffer_size = 4096;
-	u8 *avio_ctx_buffer = av_malloc(avio_ctx_buffer_size);
-	AVIOContext *avio_ctx = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size, 0, &player->encoded_data, &read_packet_callback, NULL, NULL);
-	if(avio_ctx == NULL){
-		return R(ErrAllocFailed);
-	}
-	format_ctx->pb = avio_ctx;
-	int rc = avformat_open_input(&format_ctx, NULL, NULL, NULL);
+
+	// Btw. we allocate an AVIOContext (avio_alloc_context) with a buffer and a
+	// callback that reads the file on demand, e.g. by mapping the file here and
+	// then passing the byte range to that callback.  that would work and play
+	// the sound file just fine.  however, it causes avformat_find_stream_info
+	// not to find any duration information.  not sure why.  if we pass in the
+	// "url" parameter to open_input instead, the format_context makes its own
+	// context to read the input, and find_stream_info just works and we get a
+	// duration.
+	int rc = avformat_open_input(&format_ctx, path.str, NULL, NULL);
 	if(rc < 0){
 		return ffmpegerr(rc);
 	}
@@ -741,8 +745,8 @@ static Result player_load_audio(Player *player, Slice path)
 			break;
 	}
 	// assertm(sample_size == 2, sample_size);
-	println("src spec ", src_spec.format,  ", ", src_spec.channels, ", ", src_spec.freq);
-	println("dst spec ", player->dst_audio_spec.format,  ", ", player->dst_audio_spec.channels, ", ", player->dst_audio_spec.freq);
+	// println("src spec ", src_spec.format,  ", ", src_spec.channels, ", ", src_spec.freq);
+	// println("dst spec ", player->dst_audio_spec.format,  ", ", player->dst_audio_spec.channels, ", ", player->dst_audio_spec.freq);
 
 	if(player->current_audio_stream){
 		SDL_UnbindAudioStream(player->current_audio_stream);
@@ -759,7 +763,6 @@ static Result player_load_audio(Player *player, Slice path)
 	player->current_audio_stream = audio_stream;
 
 	player->format_context = format_ctx;
-	player->avio_context = avio_ctx;
 	player->stream = stream;
 	player->codec_context = codec_context;
 	player->audio_stream_idx = audio_stream_idx;
@@ -769,9 +772,28 @@ static Result player_load_audio(Player *player, Slice path)
 	return R(Ok);
 }
 
+
+static bool key_is_down(const InputState *input_state, KeyId key){
+	return input_state->keys[key].down;
+}
+
 static bool key_was_just_pressed(const InputState *input_state, KeyId key){
 	return input_state->keys[key].changes >= 2 
 		|| (input_state->keys[key].down && input_state->keys[key].changes == 1);
+}
+
+
+static void update_window_height(Player *player, f32 w, f32 h){
+	player->window_width = w;
+	player->window_height = h;
+	int row_count = (int)(w / player->font_line_skip);
+	float bottom_pad = player->font_line_skip * 2;
+	player->playlist_height = h - bottom_pad;
+}
+
+static bool point_in_box(f32 x, f32 y, f32 left, f32 top, f32 right, f32 bottom)
+{
+	return x >= left && x < right && y >= top && y < bottom;
 }
 
 int main(void){
@@ -779,9 +801,12 @@ int main(void){
 	player.playlist_playing_idx = -1;
 	InputState input_state = {};
 	player.playlist = make_playlist_from_directory(S("/home/aru/Music/"));
+	//av_log_set_callback(libavcodec_log_callback);
+	av_log_set_level(AV_LOG_QUIET);
 
 	// SDL_SetHint(SDL_HINT_SHUTDOWN_DBUS_ON_QUIT, "1");
 	SDL_Init(SDL_INIT_AUDIO);
+	player.avmutex = SDL_CreateMutex();
 	TTF_Init();
 	player.dst_audio_spec = (SDL_AudioSpec){
 		.format = SDL_AUDIO_S16,
@@ -805,7 +830,7 @@ int main(void){
 		font = TTF_OpenFontIO(fontio, true, 16.0f);
 		if(!font){
 			const char *err = SDL_GetError();
-			println("failed to open font ", err);
+			eprintln("failed to open font ", err);
 		}
 		assert(font != NULL);
 	}
@@ -819,11 +844,13 @@ int main(void){
 		SDL_GetRenderOutputSize(renderer, &w, &h);
 		player.window_width = (f32)w;
 		player.window_height = (f32)h;
+		player.playlist_height = (f32)h;
 	}
 	int numdrivers = SDL_GetNumRenderDrivers();
 	SDL_SetRenderVSync(renderer, 1);
 
 	player.font_line_skip = TTF_GetFontLineSkip(font);
+	update_window_height(&player, player.window_width, player.window_height);
 	constexpr SDL_Color fontfg = {0xff, 0xff, 0xff, 0xff};
 	for(u32 i = 0x20; i < 128; ++i){
 		TTF_GetGlyphMetrics(font, i, NULL, NULL, NULL, NULL, &player.ascii_glyphs[i].advance);
@@ -875,8 +902,31 @@ int main(void){
 						input_state.keys[key].changes++;
 					}
 					break;
+				case SDL_EVENT_WINDOW_RESIZED:
+					int w = ev.window.data1;
+					int h = ev.window.data2;
+					update_window_height(&player, (f32)w, (f32)h);
+					break;
 				case SDL_EVENT_QUIT:
 					running = 0;
+					break;
+				case SDL_EVENT_MOUSE_MOTION:
+					input_state.mouse_x = ev.motion.x;
+					input_state.mouse_y = ev.motion.y;
+					break;
+				case SDL_EVENT_MOUSE_BUTTON_UP:
+				case SDL_EVENT_MOUSE_BUTTON_DOWN:
+					switch(ev.button.button){
+						case 1: key = KeyMouseL; break;
+						case 3: key = KeyMouseR; break;
+						default:
+							break;
+					}
+					if(key != KeyNone){
+						assert(key < KeyCount);
+						input_state.keys[key].down = ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+						input_state.keys[key].changes++;
+					}
 					break;
 			}
 		}
@@ -912,11 +962,41 @@ int main(void){
 				}
 			}
 		}
+		if(key_is_down(&input_state, KeyMouseL) && player.stream){
+			f32 progress_bar_y_start = player.playlist_height;
+			f32 progress_bar_y_end = player.playlist_height + player.font_line_skip;
+			f32 progress_bar_x_start = 0.0f;
+			f32 progress_bar_x_end = player.window_width;
+			if(point_in_box(input_state.mouse_x, input_state.mouse_y, progress_bar_x_start, progress_bar_y_start, progress_bar_x_end, progress_bar_y_end)){
+				f32 relative = (input_state.mouse_x - progress_bar_x_start) / (progress_bar_x_end - progress_bar_x_start);
+				int flags = 0;
+				if(fabsf(relative - player.last_relative_duration) > 5e-3){
+					if(relative < player.last_relative_duration){
+						flags |= AVSEEK_FLAG_BACKWARD;
+					}
+					i64 timestamp_to_seek = (f32)player.stream->duration * relative;
+					SDL_LockMutex(player.avmutex);
+					av_seek_frame(player.format_context, player.audio_stream_idx, timestamp_to_seek, flags);
+					player.last_relative_duration = relative;
+					if(player.current_frame){
+						av_frame_free(&player.current_frame);
+						player.current_frame = NULL;
+					}
+					player.current_frame_sample = 0;
+					if(player.current_packet){
+						av_packet_free(&player.current_packet);
+						player.current_packet = NULL;
+					}
+					SDL_UnlockMutex(player.avmutex);
+				}
+			}
+		}
 
 		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
 		SDL_RenderClear(renderer);
 		draw_playlist(renderer, &player, 0.0f, 0.0f);
-		// draw_text(renderer, player.ascii_glyphs, S("hello world"), 0.0f, 0.0f);
+		draw_progress_bar(renderer, &player, 0.0f, player.playlist_height);
+		draw_currently_playing(renderer, &player, 0.0f, player.playlist_height + player.font_line_skip);
 		SDL_RenderPresent(renderer);
 	}
 
