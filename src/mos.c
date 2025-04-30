@@ -1,3 +1,9 @@
+// TODO:
+// shuffle and autoplay
+// move directories. show directories in view
+// toggle to sort all entries by name or mtime
+// quick jump to predefined directories
+// load playlist from files
 #include "def.h"
 
 #include <SDL3/SDL_audio.h>
@@ -6,6 +12,7 @@
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_oldnames.h>
+#include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_render.h>
 #include <SDL3/SDL_iostream.h>
@@ -17,14 +24,6 @@
 #include <libavformat/avio.h>
 #include <libavutil/file.h>
 #include <libavutil/mem.h>
-
-void qsort_r(
-	void *base,
-	size_t n,
-	size_t size,
-	typeof(int (const void *, const void *, void *)) *compar, 
-	void *arg
-);
 
 typedef enum {
 	Ok,
@@ -110,6 +109,7 @@ static const Slice accepted_extensions[] = {
 
 typedef struct {
 	Sub path;
+	i32 name_offset;
 	ExtensionId ext;
 	i64 mtime;
 } MusicEntry;
@@ -127,6 +127,7 @@ typedef struct {
 } MusicEntryList;
 
 typedef struct {
+	Sub base_name;
 	MusicEntryList entries;
 	CharList names;
 } Playlist;
@@ -178,7 +179,8 @@ static void log_err(Result r){
 	}
 }
 
-static int compare_sub(const void *pa, const void *pb, void *arg){
+// funny that the order of parameters in SDL_qsort_r is different from stdlib qsort_r
+static int compare_sub(void *arg, const void *pa, const void *pb){
 	const CharList *strdata = arg;
 	const Sub *a = pa;
 	const Sub *b = pb;
@@ -271,6 +273,9 @@ static Playlist make_playlist_from_directory(Slice directory){
 	}
 	i32 baselen = fullpath.count;
 	CharList names = make_charlist();
+	push_string(&names, fullpath.data, fullpath.count);
+	pl.base_name.start = 0;
+	pl.base_name.len = baselen;
 	MusicEntryList entries = make_entrylist();
 
 	while(1){
@@ -299,6 +304,7 @@ static Playlist make_playlist_from_directory(Slice directory){
 		assert(ext_id < ExtIdCount);
 		MusicEntry music_entry;
 		music_entry.path.start = names.count;
+		music_entry.name_offset = baselen;
 		music_entry.path.len = fullpath.count;
 		music_entry.ext = ext_id;
 		music_entry.mtime = mtime;
@@ -307,7 +313,7 @@ static Playlist make_playlist_from_directory(Slice directory){
 	}
 	free(fullpath.data);
 	avio_close_dir(&dirp);
-	qsort_r(entries.data, entries.count, sizeof(entries.data[0]), compare_sub, &names);
+	SDL_qsort_r(entries.data, entries.count, sizeof(entries.data[0]), compare_sub, &names);
 	pl.names = names;
 	pl.entries = entries;
 	return pl;
@@ -559,12 +565,15 @@ static void draw_text_colored(SDL_Renderer *renderer, Glyph *ascii_glyphs, Slice
 }
 
 
-static Slice playlist_entry_name(Player *player, i32 i){
+static Slice playlist_entry_name(Player *player, i32 i, bool fullpath){
 	assert(i >= 0);
 	assert(i < player->playlist.entries.count);
 	const char *name_base = player->playlist.names.data;
 	const MusicEntry *entry = &player->playlist.entries.data[i];
-	const Slice name = { name_base + entry->path.start, entry->path.len };
+	const Slice name = {
+		name_base + entry->path.start + (fullpath ? 0 : entry->name_offset),
+		fullpath ? entry->path.len : entry->path.len - entry->name_offset
+	};
 	return name;
 }
 
@@ -574,10 +583,14 @@ static void draw_playlist(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
 		return;
 	}
 
+	draw_text(renderer, player->ascii_glyphs, (Slice){player->playlist.names.data + player->playlist.base_name.start, player->playlist.base_name.len}, x, y, player->window_width);
+	y += player->font_line_skip;
+
 	if(player->playlist_selected_idx < player->playlist_top){
 		player->playlist_top = player->playlist_selected_idx;
 	}
-	const int num_visible_entries = (int)(player->playlist_height / player->font_line_skip);
+	// because of the header line, we do height - font_line_skip.
+	const int num_visible_entries = (int)((player->playlist_height - player->font_line_skip)/ player->font_line_skip);
 	int bottom = player->playlist_top + num_visible_entries;
 	if(player->playlist_selected_idx >= bottom){
 		player->playlist_top = player->playlist_selected_idx - num_visible_entries + 1;
@@ -587,7 +600,7 @@ static void draw_playlist(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
 	assertm(relative_playlist_selected_idx <= num_visible_entries, relative_playlist_selected_idx, " ", player->playlist_top, " ", num_visible_entries);
 	int i = player->playlist_top;
 	while(1){
-		Slice name = playlist_entry_name(player, i);
+		Slice name = playlist_entry_name(player, i, false);
 		if(i == player->playlist_selected_idx){
 			draw_text_colored(renderer, player->ascii_glyphs, name, x, y, player->window_width, player->font_line_skip, (SDL_Color){.r=0x80, .g=0x80, .b=0x80, .a=0x80});
 		} else {
@@ -619,7 +632,7 @@ static void draw_progress_bar(SDL_Renderer *renderer, Player *player, f32 x, f32
 static void draw_currently_playing(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
 	if(player->playlist_playing_idx < 0)
 		return;
-	Slice name = playlist_entry_name(player, player->playlist_playing_idx);
+	Slice name = playlist_entry_name(player, player->playlist_playing_idx, false);
 	draw_text(renderer, player->ascii_glyphs, name, x, y, player->window_width);
 }
 
@@ -778,7 +791,7 @@ static bool key_is_down(const InputState *input_state, KeyId key){
 }
 
 static bool key_was_just_pressed(const InputState *input_state, KeyId key){
-	return input_state->keys[key].changes >= 2 
+	return input_state->keys[key].changes >= 2
 		|| (input_state->keys[key].down && input_state->keys[key].changes == 1);
 }
 
@@ -955,7 +968,7 @@ int main(void){
 			// TODO: if the entry is a directory. change directory, make new playlist
 			if(key_was_just_pressed(&input_state, KeyEnter)){
 				player.playlist_playing_idx = player.playlist_selected_idx;
-				Slice path = playlist_entry_name(&player, player.playlist_selected_idx);
+				Slice path = playlist_entry_name(&player, player.playlist_selected_idx, true);
 				Result rc = player_load_audio(&player, path);
 				if(!okp(rc)){
 					log_err(rc);
