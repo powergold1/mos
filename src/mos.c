@@ -1,5 +1,5 @@
 // TODO:
-// search by name, with fuzzy match
+// keep history of shuffled items for 2 purposes, so that 1. we can go back in the list, 2. so that we can make the distribution nice and don't repeat tracks too early
 // mouse wheel up and down to scroll the list
 // show length of files in list. maybe lazily.
 // move directories. show directories in view
@@ -7,9 +7,9 @@
 // toggle to sort all entries by name or mtime
 // quick jump to predefined directories
 // load playlist from files
-// keep history of shuffled items for 2 purposes, so that 1. we can go back in the list, 2. so that we can make the distribution nice and don't repeat tracks too early
 #include "def.h"
 
+#include <SDL3/SDL_keycode.h>
 #include <time.h>
 
 #include <SDL3/SDL_audio.h>
@@ -42,8 +42,12 @@ typedef enum {
 typedef enum {
 	KeyNone,
 	KeyEsc,
+	KeyBackspace,
 	KeySpace,
+	KeyCtrl,
+	KeyShift,
 	KeyB,
+	KeyF,
 	KeyG,
 	KeyN,
 	KeyQ,
@@ -51,11 +55,18 @@ typedef enum {
 	KeyX,
 	KeyUp,
 	KeyDown,
+	KeyLeft,
+	KeyRight,
 	KeyEnter,
 	KeyMouseL,
 	KeyMouseR,
 	KeyCount,
 } KeyId;
+
+typedef enum {
+	InputDefault,
+	InputFilter,
+} InputMode;
 
 typedef struct {
 	bool down;
@@ -64,9 +75,13 @@ typedef struct {
 
 typedef struct {
 	KeyPresses keys[KeyCount];
+	bool ctrl_down;
+	bool shift_down;
 	f32 mouse_x;
 	f32 mouse_y;
-} InputState;;
+	char text[32];
+	i32 text_len;
+} InputState;
 
 typedef struct {
 	ResultTag tag;
@@ -83,7 +98,6 @@ typedef struct {
 } Sub;
 
 typedef struct {
-	// int x, y;
 	SDL_Texture *texture;
 	float w;
 	float h;
@@ -136,6 +150,12 @@ typedef struct {
 } CharList;
 
 typedef struct {
+	i32 *data;
+	i32 count;
+	i32 cap;
+} I32List;
+
+typedef struct {
 	MusicEntry *data;
 	i32 count;
 	i32 cap;
@@ -147,56 +167,34 @@ typedef struct {
 	CharList names;
 } Playlist;
 
-typedef struct { u64 state;  u64 inc; } Pcg32;
+typedef struct { u64 state; u64 inc; } Pcg32;
 
 static u32 pcg32_random(Pcg32* rng)
 {
-    u64 oldstate = rng->state;
-    rng->state = oldstate * 6364136223846793005ULL + (rng->inc|1);
-    u32 xorshifted = ((oldstate >> 18u) ^ oldstate) >> 27u;
-    u32 rot = oldstate >> 59u;
-    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
+	u64 oldstate = rng->state;
+	rng->state = oldstate * 6364136223846793005ULL + (rng->inc|1);
+	u32 xorshifted = ((oldstate >> 18u) ^ oldstate) >> 27u;
+	u32 rot = oldstate >> 59u;
+	return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
 }
 
 static void pcg32_seed(Pcg32* rng, uint64_t initstate, uint64_t initseq)
 {
-    rng->state = 0U;
-    rng->inc = (initseq << 1u) | 1u;
-    pcg32_random(rng);
-    rng->state += initstate;
-    pcg32_random(rng);
+	rng->state = 0U;
+	rng->inc = (initseq << 1u) | 1u;
+	pcg32_random(rng);
+	rng->state += initstate;
+	pcg32_random(rng);
 }
 
 static u32 pcg32_boundedrand(Pcg32* rng, u32 bound)
 {
-    // To avoid bias, we need to make the range of the RNG a multiple of
-    // bound, which we do by dropping output less than a threshold.
-    // A naive scheme to calculate the threshold would be to do
-    //
-    //     u32 threshold = 0x100000000ull % bound;
-    //
-    // but 64-bit div/mod is slower than 32-bit div/mod (especially on
-    // 32-bit platforms).  In essence, we do
-    //
-    //     u32 threshold = (0x100000000ull-bound) % bound;
-    //
-    // because this version will calculate the same modulus, but the LHS
-    // value is less than 2^32.
-
-    u32 threshold = -bound % bound;
-
-    // Uniformity guarantees that this loop will terminate.  In practice, it
-    // should usually terminate quickly; on average (assuming all bounds are
-    // equally likely), 82.25% of the time, we can expect it to require just
-    // one iteration.  In the worst case, someone passes a bound of 2^31 + 1
-    // (i.e., 2147483649), which invalidates almost 50% of the range.  In
-    // practice, bounds are typically small and only a tiny amount of the range
-    // is eliminated.
-	 while(1){
-        u32 r = pcg32_random(rng);
-        if (r >= threshold)
-            return r % bound;
-    }
+	u32 threshold = -bound % bound;
+	while(1){
+		u32 r = pcg32_random(rng);
+		if (r >= threshold)
+			return r % bound;
+	}
 }
 
 typedef struct {
@@ -208,6 +206,7 @@ typedef struct {
 	f32 font_line_skip;
 
 	Playlist playlist;
+	i32 previous_selected_idx;
 	i32 playlist_selected_idx;
 	i32 playlist_top;
 	i32 playlist_playing_idx;
@@ -234,6 +233,10 @@ typedef struct {
 	f32 last_relative_duration;
 
 	Pcg32 rng;
+	InputMode input_mode;
+	CharList filter_prompt;
+	i32 filter_prompt_cursor;
+	I32List matching_items;
 } Player;
 
 constexpr u8 font_bytes[] = {
@@ -272,9 +275,28 @@ static void push_string(CharList *l, const char *str, i32 len){
 		do {
 			l->cap *= 2;
 		} while(l->count + len > l->cap);
-		l->data = realloc(l->data, sizeof(l->data[0]) * l->cap);
+		l->data = realloc(l->data, l->cap * sizeof(l->data[0]));
 	}
 	memcpy(l->data + l->count, str, len);
+	l->count += len;
+}
+
+static void delete_chars(CharList *l, i32 at, i32 n){
+	assert(at + n <= l->count);
+	i32 r = l->count - at + n;
+	memmove(l->data + at, l->data + at + n, r);
+	l->count -= n;
+}
+
+static void insert_string(CharList *l, i32 at, const char *str, i32 len){
+	if(l->count + len > l->cap){
+		do {
+			l->cap *= 2;
+		} while(l->count + len > l->cap);
+		l->data = realloc(l->data, sizeof(l->data[0]) * l->cap);
+	}
+	memmove(l->data + at + len, l->data + at, len);
+	memcpy(l->data + at, str, len);
 	l->count += len;
 }
 
@@ -294,6 +316,24 @@ static CharList make_charlist(void){
 	l.count = 0;
 	l.cap = cap;
 	return l;
+}
+
+static I32List make_i32list(void){
+	i32 cap = 64;
+	I32List l;
+	l.data = malloc(cap * sizeof(l.data[0]));
+	l.count = 0;
+	l.cap = cap;
+	return l;
+}
+
+static void push_i32(I32List *l, i32 x){
+	if(l->count >= l->cap){
+		l->cap *= 2;
+		l->data = realloc(l->data, sizeof(l->data[0]) * l->cap);
+	}
+	l->data[l->count] = x;
+	l->count += 1;
 }
 
 static MusicEntryList make_entrylist(void){
@@ -413,6 +453,14 @@ static void free_playlist(Playlist *pl){
 static void free_player(Player *player){
 	assert(player != NULL);
 	free_playlist(&player->playlist);
+	free(player->matching_items.data);
+	player->matching_items.data = NULL;
+	player->matching_items.count = 0;
+	player->matching_items.cap = 0;
+	free(player->filter_prompt.data);
+	player->filter_prompt.data = NULL;
+	player->filter_prompt.count = 0;
+	player->filter_prompt.cap = 0;
 	if(player->current_audio_stream){
 		SDL_DestroyAudioStream(player->current_audio_stream);
 	}
@@ -463,7 +511,6 @@ static void audio_stream_callback(void *userdata, SDL_AudioStream *stream, int a
 						}
 						// actual error
 						if(rc < 0 && 0 == player->eof){
-							// TODO: error, so stop playback?
 							av_packet_free(&packet);
 							packet = NULL;
 						}
@@ -641,14 +688,29 @@ static Slice playlist_entry_name(Player *player, i32 i, bool fullpath){
 	return name;
 }
 
+static f32 measure_text_advance(Glyph *ascii_glyphs, Slice text){
+	f32 res = 0.0;
+	for(i32 i = 0; i < text.len; ++i){
+		res += ascii_glyphs[(u32)text.str[i]].advance;
+	}
+	return res;
+}
 
 static void draw_playlist(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
 	if(player->playlist.entries.count <= 0){
 		return;
 	}
 
-	draw_text(renderer, player->ascii_glyphs, (Slice){player->playlist.names.data + player->playlist.base_name.start, player->playlist.base_name.len}, x, y, player->window_width);
-	y += player->font_line_skip;
+	if(player->input_mode == InputDefault){
+		draw_text(renderer, player->ascii_glyphs, (Slice){player->playlist.names.data + player->playlist.base_name.start, player->playlist.base_name.len}, x, y, player->window_width);
+		y += player->font_line_skip;
+	} else if(player->input_mode == InputFilter){
+		draw_text(renderer, player->ascii_glyphs, S("Search: "), x, y, player->window_width);
+		f32 x2 = measure_text_advance(player->ascii_glyphs, S("Search: "));
+		Slice filter_query_text = {player->filter_prompt.data, player->filter_prompt.count};
+		draw_text(renderer, player->ascii_glyphs, filter_query_text, x2, y, player->window_width);
+		y += player->font_line_skip;
+	}
 
 	if(player->playlist_selected_idx < player->playlist_top){
 		player->playlist_top = player->playlist_selected_idx;
@@ -663,8 +725,12 @@ static void draw_playlist(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
 	assertm(relative_playlist_selected_idx >= 0, relative_playlist_selected_idx, " ", player->playlist_top, " ", num_visible_entries);
 	assertm(relative_playlist_selected_idx <= num_visible_entries, relative_playlist_selected_idx, " ", player->playlist_top, " ", num_visible_entries);
 	int i = player->playlist_top;
+	int max_i = player->input_mode == InputDefault ? player->playlist.entries.count : player->matching_items.count;
 	while(1){
-		Slice name = playlist_entry_name(player, i, false);
+		if(i >= max_i)
+			break;
+		const i32 j = player->input_mode == InputDefault ? i : player->matching_items.data[i];
+		Slice name = playlist_entry_name(player, j, false);
 		if(i == player->playlist_selected_idx){
 			draw_text_colored(renderer, player->ascii_glyphs, name, x, y, player->window_width, player->font_line_skip, (SDL_Color){.r=0x80, .g=0x80, .b=0x80, .a=0x80});
 		} else {
@@ -756,14 +822,6 @@ static Result player_load_audio(Player *player, Slice path)
 		return R(ErrAllocFailed);
 	}
 
-	// Btw. we allocate an AVIOContext (avio_alloc_context) with a buffer and a
-	// callback that reads the file on demand, e.g. by mapping the file here and
-	// then passing the byte range to that callback.  that would work and play
-	// the sound file just fine.  however, it causes avformat_find_stream_info
-	// not to find any duration information.  not sure why.  if we pass in the
-	// "url" parameter to open_input instead, the format_context makes its own
-	// context to read the input, and find_stream_info just works and we get a
-	// duration.
 	int rc = avformat_open_input(&format_ctx, path.str, NULL, NULL);
 	if(rc < 0){
 		return ffmpegerr(rc);
@@ -875,6 +933,43 @@ static void update_window_height(Player *player, f32 w, f32 h){
 	player->max_progress_bar_width = w - player->ascii_glyphs['S'].advance - player->ascii_glyphs['X'].advance - 2;
 }
 
+static bool is_alpha(char c){
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static void update_playlist_filter(Player *player){
+	// TODO: be smarter about resetting the selected index. try to keep the same track. otherwise take the closest idx that passes the filter.
+	player->matching_items.count = 0;
+	player->playlist_selected_idx = 0;
+	player->playlist_top = 0;
+	for(i32 i = 0; i < player->playlist.entries.count; ++i){
+		i32 j = 0;
+		i32 k = 0;
+		bool ok = 1;
+		Slice name = playlist_entry_name(player, i, false);
+		// TODO: better fuzzy match with multiple separate words maybe?
+		while(k < player->filter_prompt.count){
+			if(j >= name.len){
+				ok = 0;
+				break;
+			}
+			const char a = name.str[j];
+			const char b = player->filter_prompt.data[k];
+			if(a == b || (is_alpha(a) && is_alpha(b) && (a | 32) == (b | 32))) {
+				j++;
+				k++;
+			} else {
+				j++;
+				k = 0;
+			}
+		}
+		if(ok){
+			push_i32(&player->matching_items, i);
+		}
+	}
+}
+
+
 static bool point_in_box(f32 x, f32 y, f32 left, f32 top, f32 right, f32 bottom)
 {
 	return x >= left && x < right && y >= top && y < bottom;
@@ -882,6 +977,8 @@ static bool point_in_box(f32 x, f32 y, f32 left, f32 top, f32 right, f32 bottom)
 
 int main(void){
 	Player player = {};
+	player.matching_items = make_i32list();
+	player.filter_prompt = make_charlist();
 	{
 		struct timespec ts;
 		timespec_get(&ts, TIME_UTC);
@@ -970,20 +1067,40 @@ int main(void){
 		for(int i = 0; i < KeyCount; ++i){
 			input_state.keys[i].changes = 0;
 		}
+		input_state.text_len = 0;
 
 		SDL_Event ev;
 		while(SDL_PollEvent(&ev)){
 			KeyId key = KeyNone;
 			switch(ev.type){
+				case SDL_EVENT_TEXT_INPUT:
+					i32 len = strlen(ev.text.text);
+					i32 to_copy = MIN(len, (i32)sizeof(input_state.text) - input_state.text_len - 1);
+					memcpy(input_state.text + input_state.text_len, ev.text.text, to_copy);
+					input_state.text_len += to_copy;
+					input_state.text[input_state.text_len] = 0;
+					break;
 				case SDL_EVENT_KEY_DOWN:
 				case SDL_EVENT_KEY_UP:
 					switch(ev.key.key){
 						case SDLK_ESCAPE: key = KeyEsc; break;
+						case SDLK_BACKSPACE: key = KeyBackspace; break;
 						case SDLK_SPACE: key = KeySpace; break;
-						case SDLK_DOWN: key = KeyDown; break;
 						case SDLK_UP: key = KeyUp; break;
+						case SDLK_DOWN: key = KeyDown; break;
+						case SDLK_LEFT: key = KeyLeft; break;
+						case SDLK_RIGHT: key = KeyRight; break;
 						case SDLK_RETURN: key = KeyEnter; break;
+						case SDLK_LCTRL:
+						case SDLK_RCTRL:
+							input_state.ctrl_down = ev.type == SDL_EVENT_KEY_DOWN;
+							break;
+						case SDLK_LSHIFT:
+						case SDLK_RSHIFT:
+							input_state.shift_down = ev.type == SDL_EVENT_KEY_DOWN;
+							break;
 						case SDLK_B: key = KeyB; break;
+						case SDLK_F: key = KeyF; break;
 						case SDLK_G: key = KeyG; break;
 						case SDLK_N: key = KeyN; break;
 						case SDLK_Q: key = KeyQ; break;
@@ -1026,98 +1143,150 @@ int main(void){
 			}
 		}
 
-		if(key_was_just_pressed(&input_state, KeyEsc) || key_was_just_pressed(&input_state, KeyQ)){
-			running = 0;
-		}
-		if(player.playlist_playing_idx >= 0 && key_was_just_pressed(&input_state, KeySpace)){
-			player.paused = !player.paused;
-			if(player.paused){
-				SDL_PauseAudioDevice(player.audio_device_id);
-			} else {
-				SDL_ResumeAudioDevice(player.audio_device_id);
+		if(player.input_mode == InputDefault){
+			if(key_was_just_pressed(&input_state, KeyEsc) || key_was_just_pressed(&input_state, KeyQ)){
+				running = 0;
 			}
-		}
-		if(player.playlist.entries.count > 0){
-			if(key_was_just_pressed(&input_state, KeyDown)){
-				player.playlist_selected_idx = (player.playlist_selected_idx + 1) % player.playlist.entries.count;
-			}
-			if(key_was_just_pressed(&input_state, KeyUp)){
-				player.playlist_selected_idx = (player.playlist_selected_idx - 1);
-				if(player.playlist_selected_idx < 0){
-					player.playlist_selected_idx = player.playlist.entries.count - 1;
+			if(player.playlist_playing_idx >= 0 && key_was_just_pressed(&input_state, KeySpace)){
+				player.paused = !player.paused;
+				if(player.paused){
+					SDL_PauseAudioDevice(player.audio_device_id);
+				} else {
+					SDL_ResumeAudioDevice(player.audio_device_id);
 				}
 			}
-			// TODO: if the entry is a directory. change directory, make new playlist
-			if(key_was_just_pressed(&input_state, KeyEnter)){
-				player.playlist_playing_idx = player.playlist_selected_idx;
-				Slice path = playlist_entry_name(&player, player.playlist_selected_idx, true);
+			if(player.playlist.entries.count > 0){
+				if(key_was_just_pressed(&input_state, KeyDown)){
+					player.playlist_selected_idx = (player.playlist_selected_idx + 1) % player.playlist.entries.count;
+				}
+				if(key_was_just_pressed(&input_state, KeyUp)){
+					player.playlist_selected_idx = (player.playlist_selected_idx - 1);
+					if(player.playlist_selected_idx < 0){
+						player.playlist_selected_idx = player.playlist.entries.count - 1;
+					}
+				}
+				// TODO: if the entry is a directory. change directory, make new playlist
+				if(key_was_just_pressed(&input_state, KeyEnter)){
+					player.playlist_playing_idx = player.playlist_selected_idx;
+					Slice path = playlist_entry_name(&player, player.playlist_selected_idx, true);
+					Result rc = player_load_audio(&player, path);
+					if(!okp(rc)){
+						log_err(rc);
+					}
+				}
+			}
+			if(key_is_down(&input_state, KeyMouseL) && player.stream){
+				f32 progress_bar_y_start = player.playlist_height;
+				f32 progress_bar_y_end = player.playlist_height + player.font_line_skip;
+				f32 progress_bar_x_start = 0.0f;
+				f32 progress_bar_x_end = player.max_progress_bar_width;
+				if(point_in_box(input_state.mouse_x, input_state.mouse_y, progress_bar_x_start, progress_bar_y_start, progress_bar_x_end, progress_bar_y_end)){
+					f32 relative = (input_state.mouse_x - progress_bar_x_start) / (progress_bar_x_end - progress_bar_x_start);
+					int flags = 0;
+					if(fabsf(relative - player.last_relative_duration) > 5e-3){
+						if(relative < player.last_relative_duration){
+							flags |= AVSEEK_FLAG_BACKWARD;
+						}
+						i64 timestamp_to_seek = (f32)player.stream->duration * relative;
+						SDL_LockMutex(player.avmutex);
+						av_seek_frame(player.format_context, player.audio_stream_idx, timestamp_to_seek, flags);
+						player.last_relative_duration = relative;
+						if(player.current_frame){
+							av_frame_free(&player.current_frame);
+							player.current_frame = NULL;
+						}
+						player.current_frame_sample = 0;
+						if(player.current_packet){
+							av_packet_free(&player.current_packet);
+							player.current_packet = NULL;
+						}
+						SDL_UnlockMutex(player.avmutex);
+					}
+				}
+			}
+
+			if(key_was_just_pressed(&input_state, KeyX)){
+				player.auto_next = !player.auto_next;
+			}
+			if(key_was_just_pressed(&input_state, KeyS)){
+				player.shuffle = !player.shuffle;
+			}
+			if(key_was_just_pressed(&input_state, KeyG)){
+				if(player.playlist_playing_idx >= 0){
+					player.playlist_selected_idx = player.playlist_playing_idx;
+				}
+			}
+			// TODO: this input system is a bit hacky when it comes to modifiers.
+			if(input_state.ctrl_down && key_was_just_pressed(&input_state, KeyF)){
+				SDL_StartTextInput(window);
+				player.previous_selected_idx = player.playlist_selected_idx;
+				player.input_mode = InputFilter;
+				update_playlist_filter(&player);
+			}
+
+			// TODO: make these buttons respect shuffle. need a history for that. maybe i should use a deterministic noise function with a counter.
+			// TODO: put the track switching logic in a function. we repeat it a bunch of times here.
+			if(key_was_just_pressed(&input_state, KeyN)){
+				player.playlist_playing_idx = (player.playlist_playing_idx + 1) % player.playlist.entries.count;
+				Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
 				Result rc = player_load_audio(&player, path);
 				if(!okp(rc)){
 					log_err(rc);
 				}
 			}
-		}
-		if(key_is_down(&input_state, KeyMouseL) && player.stream){
-			f32 progress_bar_y_start = player.playlist_height;
-			f32 progress_bar_y_end = player.playlist_height + player.font_line_skip;
-			f32 progress_bar_x_start = 0.0f;
-			f32 progress_bar_x_end = player.max_progress_bar_width;
-			if(point_in_box(input_state.mouse_x, input_state.mouse_y, progress_bar_x_start, progress_bar_y_start, progress_bar_x_end, progress_bar_y_end)){
-				f32 relative = (input_state.mouse_x - progress_bar_x_start) / (progress_bar_x_end - progress_bar_x_start);
-				int flags = 0;
-				if(fabsf(relative - player.last_relative_duration) > 5e-3){
-					if(relative < player.last_relative_duration){
-						flags |= AVSEEK_FLAG_BACKWARD;
-					}
-					i64 timestamp_to_seek = (f32)player.stream->duration * relative;
-					SDL_LockMutex(player.avmutex);
-					av_seek_frame(player.format_context, player.audio_stream_idx, timestamp_to_seek, flags);
-					player.last_relative_duration = relative;
-					if(player.current_frame){
-						av_frame_free(&player.current_frame);
-						player.current_frame = NULL;
-					}
-					player.current_frame_sample = 0;
-					if(player.current_packet){
-						av_packet_free(&player.current_packet);
-						player.current_packet = NULL;
-					}
-					SDL_UnlockMutex(player.avmutex);
+			if(key_was_just_pressed(&input_state, KeyB)){
+				player.playlist_playing_idx = (player.playlist_playing_idx - 1);
+				if(player.playlist_playing_idx < 0){
+					player.playlist_playing_idx = player.playlist.entries.count - 1;
+				}
+				Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
+				Result rc = player_load_audio(&player, path);
+				if(!okp(rc)){
+					log_err(rc);
 				}
 			}
-		}
-
-		if(key_was_just_pressed(&input_state, KeyX)){
-			player.auto_next = !player.auto_next;
-		}
-		if(key_was_just_pressed(&input_state, KeyS)){
-			player.shuffle = !player.shuffle;
-		}
-		if(key_was_just_pressed(&input_state, KeyG)){
-			if(player.playlist_playing_idx >= 0){
-				player.playlist_selected_idx = player.playlist_playing_idx;
+		} else if(player.input_mode == InputFilter){
+			if(input_state.text_len > 0){
+				insert_string(&player.filter_prompt, player.filter_prompt_cursor, input_state.text, input_state.text_len);
+				player.filter_prompt_cursor += input_state.text_len;
+				update_playlist_filter(&player);
 			}
-		}
-
-		// TODO: make these buttons respect shuffle. need a history for that. maybe i should use a deterministic noise function with a counter.
-		// TODO: put the track switching logic in a function. we repeat it a bunch of times here.
-		if(key_was_just_pressed(&input_state, KeyN)){
-			player.playlist_playing_idx = (player.playlist_playing_idx + 1) % player.playlist.entries.count;
-			Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
-			Result rc = player_load_audio(&player, path);
-			if(!okp(rc)){
-				log_err(rc);
+			if(player.filter_prompt_cursor > 0 && key_was_just_pressed(&input_state, KeyLeft)){
+				player.filter_prompt_cursor -= 1;
 			}
-		}
-		if(key_was_just_pressed(&input_state, KeyB)){
-			player.playlist_playing_idx = (player.playlist_playing_idx - 1);
-			if(player.playlist_playing_idx < 0){
-				player.playlist_playing_idx = player.playlist.entries.count - 1;
+			if(player.filter_prompt_cursor < player.filter_prompt.count && key_was_just_pressed(&input_state, KeyRight)){
+				player.filter_prompt_cursor += 1;
 			}
-			Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
-			Result rc = player_load_audio(&player, path);
-			if(!okp(rc)){
-				log_err(rc);
+			if(player.filter_prompt_cursor > 0 && key_was_just_pressed(&input_state, KeyBackspace)){
+				player.filter_prompt_cursor -= 1;
+				delete_chars(&player.filter_prompt, player.filter_prompt_cursor, 1);
+				update_playlist_filter(&player);
+			}
+			if(key_was_just_pressed(&input_state, KeyUp)){
+				player.playlist_selected_idx -= 1;
+				if(player.playlist_selected_idx < 0){
+					player.playlist_selected_idx = player.matching_items.count - 1;
+				}
+			}
+			if(key_was_just_pressed(&input_state, KeyDown)){
+				player.playlist_selected_idx = (player.playlist_selected_idx + 1) % player.matching_items.count;
+			}
+			if(key_was_just_pressed(&input_state, KeyEnter)){
+				player.playlist_selected_idx = player.matching_items.data[player.playlist_selected_idx];
+				player.playlist_playing_idx = player.playlist_selected_idx;
+				Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
+				Result rc = player_load_audio(&player, path);
+				if(!okp(rc)){
+					log_err(rc);
+				}
+				player.input_mode = InputDefault;
+				player.filter_prompt.count = 0;
+				player.filter_prompt_cursor = 0;
+			} else if(key_was_just_pressed(&input_state, KeyEsc)){
+				player.input_mode = InputDefault;
+				player.playlist_selected_idx = player.previous_selected_idx;
+				player.filter_prompt.count = 0;
+				player.filter_prompt_cursor = 0;
 			}
 		}
 
