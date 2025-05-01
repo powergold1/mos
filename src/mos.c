@@ -1,10 +1,16 @@
 // TODO:
-// shuffle and autoplay
+// search by name, with fuzzy match
+// mouse wheel up and down to scroll the list
+// show length of files in list. maybe lazily.
 // move directories. show directories in view
+// volume control?
 // toggle to sort all entries by name or mtime
 // quick jump to predefined directories
 // load playlist from files
+// keep history of shuffled items for 2 purposes, so that 1. we can go back in the list, 2. so that we can make the distribution nice and don't repeat tracks too early
 #include "def.h"
+
+#include <time.h>
 
 #include <SDL3/SDL_audio.h>
 #include <SDL3/SDL_events.h>
@@ -37,6 +43,12 @@ typedef enum {
 	KeyNone,
 	KeyEsc,
 	KeySpace,
+	KeyB,
+	KeyG,
+	KeyN,
+	KeyQ,
+	KeyS,
+	KeyX,
 	KeyUp,
 	KeyDown,
 	KeyEnter,
@@ -90,9 +102,12 @@ typedef struct {
 	X(opus)\
 	X(ogg)\
 	X(m4a)\
+
+#if 0
 	X(xm)\
 	X(mod)\
-	X(it)\
+	X(it)
+#endif
 
 typedef enum ExtensionId {
 #define X(A) ext_##A,
@@ -132,10 +147,63 @@ typedef struct {
 	CharList names;
 } Playlist;
 
+typedef struct { u64 state;  u64 inc; } Pcg32;
+
+static u32 pcg32_random(Pcg32* rng)
+{
+    u64 oldstate = rng->state;
+    rng->state = oldstate * 6364136223846793005ULL + (rng->inc|1);
+    u32 xorshifted = ((oldstate >> 18u) ^ oldstate) >> 27u;
+    u32 rot = oldstate >> 59u;
+    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
+}
+
+static void pcg32_seed(Pcg32* rng, uint64_t initstate, uint64_t initseq)
+{
+    rng->state = 0U;
+    rng->inc = (initseq << 1u) | 1u;
+    pcg32_random(rng);
+    rng->state += initstate;
+    pcg32_random(rng);
+}
+
+static u32 pcg32_boundedrand(Pcg32* rng, u32 bound)
+{
+    // To avoid bias, we need to make the range of the RNG a multiple of
+    // bound, which we do by dropping output less than a threshold.
+    // A naive scheme to calculate the threshold would be to do
+    //
+    //     u32 threshold = 0x100000000ull % bound;
+    //
+    // but 64-bit div/mod is slower than 32-bit div/mod (especially on
+    // 32-bit platforms).  In essence, we do
+    //
+    //     u32 threshold = (0x100000000ull-bound) % bound;
+    //
+    // because this version will calculate the same modulus, but the LHS
+    // value is less than 2^32.
+
+    u32 threshold = -bound % bound;
+
+    // Uniformity guarantees that this loop will terminate.  In practice, it
+    // should usually terminate quickly; on average (assuming all bounds are
+    // equally likely), 82.25% of the time, we can expect it to require just
+    // one iteration.  In the worst case, someone passes a bound of 2^31 + 1
+    // (i.e., 2147483649), which invalidates almost 50% of the range.  In
+    // practice, bounds are typically small and only a tiny amount of the range
+    // is eliminated.
+	 while(1){
+        u32 r = pcg32_random(rng);
+        if (r >= threshold)
+            return r % bound;
+    }
+}
+
 typedef struct {
 	f32 window_height;
 	f32 playlist_height;
 	f32 window_width;
+	f32 max_progress_bar_width;
 	Glyph ascii_glyphs[128];
 	f32 font_line_skip;
 
@@ -157,11 +225,15 @@ typedef struct {
 	i32 audio_stream_idx;
 	bool eof;
 	bool paused;
+	bool auto_next;
+	bool shuffle;
 
 	AVPacket *current_packet;
 	AVFrame *current_frame;
 	i32 current_frame_sample;
 	f32 last_relative_duration;
+
+	Pcg32 rng;
 } Player;
 
 constexpr u8 font_bytes[] = {
@@ -179,7 +251,7 @@ static void log_err(Result r){
 	}
 }
 
-// funny that the order of parameters in SDL_qsort_r is different from stdlib qsort_r
+// funny that the order of parameters in SDL_qsort_r is different from the C stdlib qsort_r
 static int compare_sub(void *arg, const void *pa, const void *pb){
 	const CharList *strdata = arg;
 	const Sub *a = pa;
@@ -292,6 +364,7 @@ static Playlist make_playlist_from_directory(Slice directory){
 		i64 filemode = directory_entry->type;
 		avio_free_directory_entry(&directory_entry);
 		// TODO: AVIO_ENTRY_SYMBOLIC_LINK
+		// TODO: AVIO_ENTRY_DIRECTORY
 		if(filemode != AVIO_ENTRY_FILE){
 			continue;
 		}
@@ -347,7 +420,7 @@ static void free_player(Player *player){
 
 static void fill_silence(SDL_AudioStream *stream, int amount){
 	char buf[4*4096];
-	memset(buf, 0, sizeof(buf));
+	memset(buf, 0, MIN(amount, (int)sizeof(buf)));
 	while(amount > 0){
 		int now = MIN(amount, (int)sizeof(buf));
 		SDL_PutAudioStreamData(stream, buf, now);
@@ -357,19 +430,6 @@ static void fill_silence(SDL_AudioStream *stream, int amount){
 
 static void audio_stream_callback(void *userdata, SDL_AudioStream *stream, int additional_amount, int total_amount)
 {
-#if 0
-	println("callback ", additional_amount, " ", total_amount);
-	char buf[4096];
-	memset(buf, 0, sizeof(buf));
-	int loop = 1;
-	while(additional_amount > 0){
-		int now = MIN(additional_amount, (int)sizeof(buf));
-		SDL_PutAudioStreamData(stream, buf, now);
-		additional_amount -= now;
-	}
-#endif
-
-
 	Player *player = (Player*)userdata;
 
 	if(player->paused){
@@ -379,7 +439,6 @@ static void audio_stream_callback(void *userdata, SDL_AudioStream *stream, int a
 
 	SDL_LockMutex(player->avmutex);
 
-	int put_count = 0;
 	while(additional_amount > 0){
 		// get a new packet if we need one
 		if(NULL == player->current_packet){
@@ -409,6 +468,11 @@ static void audio_stream_callback(void *userdata, SDL_AudioStream *stream, int a
 							packet = NULL;
 						}
 					}
+				}
+				if(player->eof){
+					av_packet_free(&packet);
+					packet = NULL;
+					break;
 				}
 				if(NULL == packet){
 					break;
@@ -623,10 +687,20 @@ static void draw_progress_bar(SDL_Renderer *renderer, Player *player, f32 x, f32
 	// the audio callback thread, but this function is called from the main
 	// thread.  But I don't mind. Worst that can happen is that we read a stale
 	// value for the progress bar.
-	f32 w = player->last_relative_duration * player->window_width;
+	f32 w = player->last_relative_duration * player->max_progress_bar_width;
 	SDL_SetRenderDrawColor(renderer, 0xff, 0xff, 0xff, 0xff);
 	SDL_FRect rect = {.x=0, .y = y, .w = w, .h = player->font_line_skip, };
 	SDL_RenderFillRect(renderer, &rect);
+}
+
+static void draw_ui_indicators(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
+	SDL_FRect rect = {.x = x-2, .y = y, .w = 2, .h = player->font_line_skip, };
+	SDL_RenderFillRect(renderer, &rect);
+	SDL_Color shuffle_bg = player->shuffle ? (SDL_Color){0x60, 0x60, 0x60, 0x60} : (SDL_Color){};
+	SDL_Color auto_next_bg = player->auto_next ? (SDL_Color){0x60, 0x60, 0x60, 0x60} : (SDL_Color){};
+	draw_text_colored(renderer, player->ascii_glyphs, S("S"), x, y, player->window_width - x, player->font_line_skip, shuffle_bg);
+	x += player->ascii_glyphs['S'].advance;
+	draw_text_colored(renderer, player->ascii_glyphs, S("X"), x, y, player->window_width - x, player->font_line_skip, auto_next_bg);
 }
 
 static void draw_currently_playing(SDL_Renderer *renderer, Player *player, f32 x, f32 y){
@@ -642,10 +716,6 @@ static void draw_currently_playing(SDL_Renderer *renderer, Player *player, f32 x
 
 static Result player_load_audio(Player *player, Slice path)
 {
-	// TODO: i'm not sure if there's still a race condition where another thread
-	// can be in the audio callback trying to produce new audio while we're here
-	// trying to load new audio.  I don't think so, but if we ever get a weird
-	// crash like that, we're gonna need a mutex.
 	SDL_PauseAudioDevice(player->audio_device_id);
 
 	SDL_LockMutex(player->avmutex);
@@ -802,6 +872,7 @@ static void update_window_height(Player *player, f32 w, f32 h){
 	int row_count = (int)(w / player->font_line_skip);
 	float bottom_pad = player->font_line_skip * 2;
 	player->playlist_height = h - bottom_pad;
+	player->max_progress_bar_width = w - player->ascii_glyphs['S'].advance - player->ascii_glyphs['X'].advance - 2;
 }
 
 static bool point_in_box(f32 x, f32 y, f32 left, f32 top, f32 right, f32 bottom)
@@ -811,6 +882,11 @@ static bool point_in_box(f32 x, f32 y, f32 left, f32 top, f32 right, f32 bottom)
 
 int main(void){
 	Player player = {};
+	{
+		struct timespec ts;
+		timespec_get(&ts, TIME_UTC);
+		pcg32_seed(&player.rng, (u64)ts.tv_sec, (u64)ts.tv_nsec);
+	}
 	player.playlist_playing_idx = -1;
 	InputState input_state = {};
 	player.playlist = make_playlist_from_directory(S("/home/aru/Music/"));
@@ -833,6 +909,7 @@ int main(void){
 		eprintln("failed to open audio device");
 		return 1;
 	}
+	SDL_PauseAudioDevice(player.audio_device_id);
 
 	TTF_Font *font = NULL;
 	{
@@ -863,7 +940,6 @@ int main(void){
 	SDL_SetRenderVSync(renderer, 1);
 
 	player.font_line_skip = TTF_GetFontLineSkip(font);
-	update_window_height(&player, player.window_width, player.window_height);
 	constexpr SDL_Color fontfg = {0xff, 0xff, 0xff, 0xff};
 	for(u32 i = 0x20; i < 128; ++i){
 		TTF_GetGlyphMetrics(font, i, NULL, NULL, NULL, NULL, &player.ascii_glyphs[i].advance);
@@ -887,7 +963,7 @@ int main(void){
 	}
 	TTF_CloseFont(font);
 
-	SDL_PauseAudioDevice(player.audio_device_id);
+	update_window_height(&player, player.window_width, player.window_height);
 
 	bool running = 1;
 	while(running){
@@ -907,6 +983,12 @@ int main(void){
 						case SDLK_DOWN: key = KeyDown; break;
 						case SDLK_UP: key = KeyUp; break;
 						case SDLK_RETURN: key = KeyEnter; break;
+						case SDLK_B: key = KeyB; break;
+						case SDLK_G: key = KeyG; break;
+						case SDLK_N: key = KeyN; break;
+						case SDLK_Q: key = KeyQ; break;
+						case SDLK_S: key = KeyS; break;
+						case SDLK_X: key = KeyX; break;
 						default: break;
 					}
 					if(key != KeyNone){
@@ -944,7 +1026,7 @@ int main(void){
 			}
 		}
 
-		if(key_was_just_pressed(&input_state, KeyEsc)){
+		if(key_was_just_pressed(&input_state, KeyEsc) || key_was_just_pressed(&input_state, KeyQ)){
 			running = 0;
 		}
 		if(player.playlist_playing_idx >= 0 && key_was_just_pressed(&input_state, KeySpace)){
@@ -979,7 +1061,7 @@ int main(void){
 			f32 progress_bar_y_start = player.playlist_height;
 			f32 progress_bar_y_end = player.playlist_height + player.font_line_skip;
 			f32 progress_bar_x_start = 0.0f;
-			f32 progress_bar_x_end = player.window_width;
+			f32 progress_bar_x_end = player.max_progress_bar_width;
 			if(point_in_box(input_state.mouse_x, input_state.mouse_y, progress_bar_x_start, progress_bar_y_start, progress_bar_x_end, progress_bar_y_end)){
 				f32 relative = (input_state.mouse_x - progress_bar_x_start) / (progress_bar_x_end - progress_bar_x_start);
 				int flags = 0;
@@ -1005,10 +1087,61 @@ int main(void){
 			}
 		}
 
+		if(key_was_just_pressed(&input_state, KeyX)){
+			player.auto_next = !player.auto_next;
+		}
+		if(key_was_just_pressed(&input_state, KeyS)){
+			player.shuffle = !player.shuffle;
+		}
+		if(key_was_just_pressed(&input_state, KeyG)){
+			if(player.playlist_playing_idx >= 0){
+				player.playlist_selected_idx = player.playlist_playing_idx;
+			}
+		}
+
+		// TODO: make these buttons respect shuffle. need a history for that. maybe i should use a deterministic noise function with a counter.
+		// TODO: put the track switching logic in a function. we repeat it a bunch of times here.
+		if(key_was_just_pressed(&input_state, KeyN)){
+			player.playlist_playing_idx = (player.playlist_playing_idx + 1) % player.playlist.entries.count;
+			Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
+			Result rc = player_load_audio(&player, path);
+			if(!okp(rc)){
+				log_err(rc);
+			}
+		}
+		if(key_was_just_pressed(&input_state, KeyB)){
+			player.playlist_playing_idx = (player.playlist_playing_idx - 1);
+			if(player.playlist_playing_idx < 0){
+				player.playlist_playing_idx = player.playlist.entries.count - 1;
+			}
+			Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
+			Result rc = player_load_audio(&player, path);
+			if(!okp(rc)){
+				log_err(rc);
+			}
+		}
+
+		if(player.eof && player.auto_next){
+			if(player.shuffle){
+				// TODO: better random with some distribution guarantees? e.g.
+				// maybe ensure we don't repeat songs before at least half of the
+				// others in the playlist have played.
+				player.playlist_playing_idx = pcg32_boundedrand(&player.rng, player.playlist.entries.count);
+			} else {
+				player.playlist_playing_idx = (player.playlist_playing_idx + 1) % player.playlist.entries.count;
+			}
+			Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
+			Result rc = player_load_audio(&player, path);
+			if(!okp(rc)){
+				log_err(rc);
+			}
+		}
+
 		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
 		SDL_RenderClear(renderer);
 		draw_playlist(renderer, &player, 0.0f, 0.0f);
 		draw_progress_bar(renderer, &player, 0.0f, player.playlist_height);
+		draw_ui_indicators(renderer, &player, player.max_progress_bar_width, player.playlist_height);
 		draw_currently_playing(renderer, &player, 0.0f, player.playlist_height + player.font_line_skip);
 		SDL_RenderPresent(renderer);
 	}
