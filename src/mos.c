@@ -1,5 +1,4 @@
 // TODO:
-// remove assert channel_count == 2
 // mouse wheel up and down to scroll the list
 // mouse click to play track
 // show length of files in list. maybe lazily.
@@ -564,11 +563,9 @@ static void audio_stream_callback(void *userdata, SDL_AudioStream *stream, int a
 			continue;
 		}
 
-		// just for now
-		i32 channel_count = player->codec_context->ch_layout.nb_channels;
-		assert(channel_count == 2);
+		const i32 channel_count = player->codec_context->ch_layout.nb_channels;
 
-		int sample_size = av_get_bytes_per_sample(player->codec_context->sample_fmt);
+		const int sample_size = av_get_bytes_per_sample(player->codec_context->sample_fmt);
 		bool is_planar = 0;
 		switch(player->codec_context->sample_fmt){
 		case AV_SAMPLE_FMT_U8:
