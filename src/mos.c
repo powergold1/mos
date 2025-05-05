@@ -1,6 +1,7 @@
 // TODO:
-// keep history of shuffled items for 2 purposes, so that 1. we can go back in the list, 2. so that we can make the distribution nice and don't repeat tracks too early
+// remove assert channel_count == 2
 // mouse wheel up and down to scroll the list
+// mouse click to play track
 // show length of files in list. maybe lazily.
 // move directories. show directories in view
 // volume control?
@@ -237,6 +238,9 @@ typedef struct {
 	CharList filter_prompt;
 	i32 filter_prompt_cursor;
 	I32List matching_items;
+
+	I32List history;
+	i32 history_cursor;
 } Player;
 
 constexpr u8 font_bytes[] = {
@@ -975,9 +979,57 @@ static bool point_in_box(f32 x, f32 y, f32 left, f32 top, f32 right, f32 bottom)
 	return x >= left && x < right && y >= top && y < bottom;
 }
 
+static void set_next_track_to_play(Player *player){
+	if(player->shuffle){
+		// TODO: better random with some distribution guarantees? e.g.
+		// maybe ensure we don't repeat songs before at least half of the
+		// others in the playlist have played.
+		if(player->history_cursor >= player->history.count){
+			player->playlist_playing_idx = pcg32_boundedrand(&player->rng, player->playlist.entries.count);
+			push_i32(&player->history, player->playlist_playing_idx);
+		} else {
+			player->playlist_playing_idx = player->history.data[player->history_cursor];
+		}
+		player->history_cursor += 1;
+	} else {
+		player->playlist_playing_idx = (player->playlist_playing_idx + 1) % player->playlist.entries.count;
+	}
+}
+
+
+static void set_previous_track_to_play(Player *player){
+	if(player->shuffle){
+		if(player->history_cursor > 0){
+			player->history_cursor -= 1;
+			player->playlist_playing_idx = player->history.data[player->history_cursor];
+		} else {
+			player->playlist_playing_idx = -1;
+		}
+	} else {
+		if(player->playlist_playing_idx > 0){
+			player->playlist_playing_idx -= 1;
+		} else {
+			player->playlist_playing_idx = player->playlist.entries.count - 1;
+		}
+	}
+}
+
+
+static void load_and_play(Player *player){
+	Slice path = playlist_entry_name(player, player->playlist_playing_idx, true);
+	Result rc = player_load_audio(player, path);
+	if(!okp(rc)){
+		log_err(rc);
+	} else {
+		// TODO: I'm not sure if I always want this, but most of the time I think I want this.
+		player->playlist_selected_idx = player->playlist_playing_idx;
+	}
+}
+
 int main(void){
 	Player player = {};
 	player.matching_items = make_i32list();
+	player.history = make_i32list();
 	player.filter_prompt = make_charlist();
 	{
 		struct timespec ts;
@@ -986,7 +1038,7 @@ int main(void){
 	}
 	player.playlist_playing_idx = -1;
 	InputState input_state = {};
-	player.playlist = make_playlist_from_directory(S("/home/aru/Music/"));
+	player.playlist = make_playlist_from_directory(S("/home/aru/Music/Hardcore"));
 	//av_log_set_callback(libavcodec_log_callback);
 	av_log_set_level(AV_LOG_QUIET);
 
@@ -1022,7 +1074,7 @@ int main(void){
 		assert(font != NULL);
 	}
 
-	SDL_Window *window = SDL_CreateWindow("mos", 320, 240, 0);
+	SDL_Window *window = SDL_CreateWindow("mos", 640, 480, 0);
 	// the vulkan renderer implementation has weird glitches when rendering
 	// quads and then rendering text above those quads.
 	SDL_Renderer *renderer = SDL_CreateRenderer(window, "opengl,opengles2,vulkan,gpu,software");
@@ -1168,11 +1220,11 @@ int main(void){
 				// TODO: if the entry is a directory. change directory, make new playlist
 				if(key_was_just_pressed(&input_state, KeyEnter)){
 					player.playlist_playing_idx = player.playlist_selected_idx;
-					Slice path = playlist_entry_name(&player, player.playlist_selected_idx, true);
-					Result rc = player_load_audio(&player, path);
-					if(!okp(rc)){
-						log_err(rc);
+					if(player.shuffle){
+						push_i32(&player.history, player.playlist_playing_idx);
+						player.history_cursor += 1;
 					}
+					load_and_play(&player);
 				}
 			}
 			if(key_is_down(&input_state, KeyMouseL) && player.stream){
@@ -1227,22 +1279,15 @@ int main(void){
 			// TODO: make these buttons respect shuffle. need a history for that. maybe i should use a deterministic noise function with a counter.
 			// TODO: put the track switching logic in a function. we repeat it a bunch of times here.
 			if(key_was_just_pressed(&input_state, KeyN)){
-				player.playlist_playing_idx = (player.playlist_playing_idx + 1) % player.playlist.entries.count;
-				Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
-				Result rc = player_load_audio(&player, path);
-				if(!okp(rc)){
-					log_err(rc);
-				}
+				set_next_track_to_play(&player);
+				load_and_play(&player);
 			}
 			if(key_was_just_pressed(&input_state, KeyB)){
-				player.playlist_playing_idx = (player.playlist_playing_idx - 1);
-				if(player.playlist_playing_idx < 0){
-					player.playlist_playing_idx = player.playlist.entries.count - 1;
-				}
-				Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
-				Result rc = player_load_audio(&player, path);
-				if(!okp(rc)){
-					log_err(rc);
+				set_previous_track_to_play(&player);
+				if(player.playlist_playing_idx >= 0){
+					load_and_play(&player);
+				} else {
+					player.eof = 1;
 				}
 			}
 		} else if(player.input_mode == InputFilter){
@@ -1272,13 +1317,16 @@ int main(void){
 				player.playlist_selected_idx = (player.playlist_selected_idx + 1) % player.matching_items.count;
 			}
 			if(key_was_just_pressed(&input_state, KeyEnter)){
+				// TODO: should we keep the history and add this track to the list?
+				player.history.count = 0;
+				player.history_cursor = 0;
 				player.playlist_selected_idx = player.matching_items.data[player.playlist_selected_idx];
 				player.playlist_playing_idx = player.playlist_selected_idx;
-				Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
-				Result rc = player_load_audio(&player, path);
-				if(!okp(rc)){
-					log_err(rc);
+				if(player.shuffle){
+					push_i32(&player.history, player.playlist_playing_idx);
+					player.history_cursor += 1;
 				}
+				load_and_play(&player);
 				player.input_mode = InputDefault;
 				player.filter_prompt.count = 0;
 				player.filter_prompt_cursor = 0;
@@ -1291,19 +1339,8 @@ int main(void){
 		}
 
 		if(player.eof && player.auto_next){
-			if(player.shuffle){
-				// TODO: better random with some distribution guarantees? e.g.
-				// maybe ensure we don't repeat songs before at least half of the
-				// others in the playlist have played.
-				player.playlist_playing_idx = pcg32_boundedrand(&player.rng, player.playlist.entries.count);
-			} else {
-				player.playlist_playing_idx = (player.playlist_playing_idx + 1) % player.playlist.entries.count;
-			}
-			Slice path = playlist_entry_name(&player, player.playlist_playing_idx, true);
-			Result rc = player_load_audio(&player, path);
-			if(!okp(rc)){
-				log_err(rc);
-			}
+			set_next_track_to_play(&player);
+			load_and_play(&player);
 		}
 
 		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
